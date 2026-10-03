@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from freetoken.env import ENV
 
-from .utils import load_aot
+from .utils import _is_rocm, load_aot
 
 if TYPE_CHECKING:
     from abc import abstractmethod
@@ -27,8 +27,10 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    # TODO(ROCm): NCCL -> RCCL migration for multi-GPU tensor parallelism on AMD.
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    # AMD: link RCCL (NCCL-compatible API, hip types) instead of NCCL; pynccl.cu
+    # includes <rccl/rccl.h> under __HIP_PLATFORM_AMD__.
+    ldflags = ["-lrccl"] if _is_rocm() else ["-lnccl"]
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=ldflags)
 
 
 @functools.cache

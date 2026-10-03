@@ -1,4 +1,8 @@
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+#include <rccl/rccl.h>   // AMD RCCL: same ncclXxx API with hip types; has the symmetric-mem window API
+#else
 #include <freetoken/nccl227.h>
+#endif
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -78,6 +82,14 @@ public:
     NCCL_CHECK(::ncclCommInitRank(&comm, m_world_size, id, m_rank));
     m_comm = {comm, template_fn<::ncclCommDestroy>};
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+    // RCCL on RDNA lacks the symmetric-memory fabric (GIN/UALoE) that
+    // NCCL_WIN_COLL_SYMMETRIC requires -> ncclCommWindowRegister returns ncclInvalidUsage.
+    // Skip the symmetric-buffer/window path; all_reduce runs directly on the user buffer
+    // (m_max_bytes=0 forces the direct branch in all_reduce).
+    (void)max_bytes;
+    m_max_bytes = 0;
+#else
     void *buf;
     NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
     m_sym_mem = {buf, template_fn<::ncclMemFree>};
@@ -88,12 +100,13 @@ public:
     m_win = {win, [comm = m_comm](ncclWindow_t w) {
                return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
              }};
+#endif
   }
 
   auto all_reduce(tvm::ffi::TensorView t, std::string op) const -> void {
     using namespace host;
-    RuntimeCheck(t.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
+    RuntimeCheck(t.device().device_type == kDLCUDA || t.device().device_type == kDLROCM,
+                 "Tensor must be on a GPU device");
     RuntimeCheck(t.is_contiguous(), "Tensor must be contiguous");
     const auto size_dim = static_cast<size_t>(t.shape().Product());
     const auto dtype = kNCCLDtypeMap.at(t.dtype());
@@ -136,11 +149,11 @@ public:
   auto all_gather(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) const
       -> void {
     using namespace host;
-    RuntimeCheck(src.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
+    RuntimeCheck(src.device().device_type == kDLCUDA || src.device().device_type == kDLROCM,
+                 "Tensor must be on a GPU device");
     RuntimeCheck(src.is_contiguous(), "Tensor must be contiguous");
-    RuntimeCheck(dst.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
+    RuntimeCheck(dst.device().device_type == kDLCUDA || dst.device().device_type == kDLROCM,
+                 "Tensor must be on a GPU device");
     RuntimeCheck(dst.is_contiguous(), "Tensor must be contiguous");
     RuntimeCheck(dst.size(0) == src.size(0) * m_world_size,
                  "Destination tensor has incorrect size");
