@@ -44,6 +44,14 @@
 #define cudaGetLastError hipGetLastError
 #endif
 
+#ifndef cudaMemcpyAsync
+#define cudaMemcpyAsync hipMemcpyAsync
+#endif
+
+#ifndef cudaMemcpyDeviceToDevice
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#endif
+
 #ifndef cudaMallocHost
 #define cudaMallocHost hipHostMalloc
 #endif
