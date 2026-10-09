@@ -62,6 +62,22 @@ def is_rocm() -> bool:
 
 
 @functools.cache
+def is_radeon_installed() -> bool:
+    """True when the Radeon Operator Library (``radeon_ops``) is importable AND its native
+    HIP library loads — gates routing the bf16 MoE decode GEMV to the native kernel on RDNA.
+    Honors ``RADEON_OPS_LIB``; any failure cleanly falls back to the Triton path."""
+    if not is_rocm() or not _importable("radeon_ops"):
+        return False
+    try:
+        from radeon_ops.backends.hip.native.gdn import _need_lib
+
+        _need_lib()
+        return True
+    except Exception:
+        return False
+
+
+@functools.cache
 def driver_cuda_version() -> int | None:
     """Max CUDA version the installed NVIDIA driver supports (``13000`` == CUDA 13.0),
     or None if undetermined. Driver-JIT kernels (PTX compiled at runtime, e.g.

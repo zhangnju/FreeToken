@@ -50,8 +50,26 @@ class TritonFp8BlockLinearKernel(LinearKernel):
         return None
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
+        import os
+
         from freetoken.kernel.triton.fp8_block_linear import block_fp8_linear
 
+        # RDNA native dense fp8 block-scale GEMV (radeon_ops) for the decode GEMV at moderate N (e.g. GDN
+        # out_proj, K=4096 N=2048 ~2x vs triton, bit-exact). Gated: M=1 decode, no bias, bf16 x, N<=8192
+        # (triton's tuned big-N GEMV wins large N -- see dense_gemv_fp8.hip). Toggle RADEON_DENSE_FP8=0.
+        if (
+            os.environ.get("RADEON_DENSE_FP8", "1") != "0"
+            and x.dim() == 2 and x.shape[0] == 1
+            and layer.bias is None
+            and x.dtype is torch.bfloat16
+            and layer.weight.shape[0] <= 8192
+        ):
+            from freetoken.kernel.backend import is_radeon_installed
+
+            if is_radeon_installed():
+                from radeon_ops.backends.hip.native.moe import run_dense_gemv_fp8
+
+                return run_dense_gemv_fp8(x, layer.weight, layer.weight_scale_inv)
         return block_fp8_linear(x, layer.weight, layer.weight_scale_inv, layer.bias)
 
 
@@ -68,3 +86,32 @@ class Fp8BlockLinearMethod(LinearMethod):
         # e8m0 codes stay codes for the dsv4 kernel; float scales are bf16 as the readers push them today
         scale_dtype = E8M0 if _e8m0(g) else torch.bfloat16
         layer.weight_scale_inv = torch.empty(g.out_features // block, g.in_features // block, dtype=scale_dtype)
+
+
+class TritonFp8BlockQuantizeAtLoadKernel(TritonFp8BlockLinearKernel):
+    """Same W8A16 GEMV, but the weight arrives bf16 and is block-quantized to fp8 + bf16 scale once,
+    post-load, in ``finalize`` -- for weights the checkpoint ships unquantized (e.g. lm_head)."""
+
+    name = "triton_qat"
+
+    def finalize(self, layer: Any) -> None:
+        from freetoken.kernel.triton.fp8_block_linear import per_block_quant_fp8
+
+        if layer.weight.dtype is FP8:  # idempotent guard
+            return
+        w_fp8, scale = per_block_quant_fp8(layer.weight)
+        layer.weight = w_fp8
+        layer.weight_scale_inv = scale
+
+
+@register_method(QuantKind.FP8_BLOCK_QAT, LayerKind.LINEAR)
+class Fp8BlockQuantizeAtLoadLinearMethod(LinearMethod):
+    """fp8-block linear whose checkpoint weight is bf16; quantized to fp8 at load (see the kernel's finalize)."""
+
+    candidates = (TritonFp8BlockQuantizeAtLoadKernel,)
+
+    def create_weights(self, layer: Any) -> None:
+        g = self.cfg
+        if g.in_features % FP8_BLOCK or any(o % FP8_BLOCK for o in g.output_sizes):
+            raise ValueError(f"block-fp8(QAT) needs in/out divisible by {FP8_BLOCK}, got K={g.in_features} N={g.output_sizes}")
+        layer.weight = torch.empty(g.out_features, g.in_features, dtype=torch.bfloat16)

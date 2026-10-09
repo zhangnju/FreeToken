@@ -44,6 +44,42 @@ def fused_topk(
     return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
 
 
+def _rocm_moe_align_torch(topk_ids, block_size, num_experts):
+    # Correct AND cuda-graph-capturable torch moe_align for ROCm. The triton moe_align
+    # fallback returns expert_ids MISALIGNED with sorted_token_ids on gfx1201/triton 3.8
+    # (block b's tokens route to a different expert than expert_ids[b] -> the grouped GEMM
+    # applies the wrong expert weights, ~96% of outputs wrong / fp8 path OOB-faults). Static
+    # shapes + no .item()/host sync so it stays capturable (matches the sgl allocation).
+    dev = topk_ids.device
+    flat = topk_ids.reshape(-1).to(torch.int64)
+    nv = flat.numel()
+    if nv < num_experts + 1:
+        max_pad = nv * block_size
+    else:
+        max_pad = nv + (num_experts + 1) * (block_size - 1)
+    max_blocks = (max_pad + block_size - 1) // block_size
+    order = torch.argsort(flat, stable=True)
+    se = flat[order]
+    # bincount syncs device->host (not graph-capturable); scatter_add instead.
+    counts = torch.zeros(num_experts, dtype=torch.int64, device=dev).scatter_add_(
+        0, flat, torch.ones_like(flat))
+    padded = ((counts + block_size - 1) // block_size) * block_size
+    off = padded.cumsum(0) - padded            # per-expert token offset in padded layout
+    roff = counts.cumsum(0) - counts
+    total = padded.sum()                       # GPU scalar tensor (no host sync)
+    rank = torch.arange(nv, device=dev) - roff[se]
+    slot = off[se] + rank
+    sorted_ids = torch.full((max_pad,), nv, dtype=torch.int32, device=dev)
+    sorted_ids[slot] = order.to(torch.int32)
+    # expert id per block b = the expert whose contiguous block range contains b
+    nblocks = padded // block_size
+    end = nblocks.cumsum(0)                     # block-count boundaries per expert
+    blk = torch.arange(max_blocks, device=dev)
+    expert_ids = torch.clamp(torch.searchsorted(end, blk, right=True),
+                             max=num_experts - 1).to(torch.int32)
+    ntpp = total.to(torch.int32).reshape(1)
+    return sorted_ids, expert_ids, ntpp
+
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -84,6 +120,10 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    import torch as _t
+    if _t.version.hip is not None:
+        return _rocm_moe_align_torch(topk_ids, block_size, num_experts)
+
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
     if not is_sgl_kernel_installed():
@@ -217,6 +257,24 @@ def fused_experts_impl(
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     M = num_tokens
+
+    # RDNA native MoE decode GEMV (radeon_ops): the resident bf16 path routes decode through here
+    # too; at small T the grouped Triton kernel is parallelism-starved, the native GEMV is ~2-3.7x.
+    if (
+        M <= 16
+        and activation == "silu"
+        and not apply_router_weight_on_input
+        and act_alpha == 1.0
+        and act_limit == float("inf")
+        and hidden_states.dtype is torch.bfloat16
+    ):
+        from freetoken.kernel.backend import is_radeon_installed
+
+        if is_radeon_installed():
+            from radeon_ops.backends.hip.native.moe import run_moe_decode_gemv
+
+            return run_moe_decode_gemv(hidden_states, w1, w2, topk_ids, topk_weights)
+
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w1.shape,
@@ -325,6 +383,24 @@ def fused_experts_decode_impl(
     assert w1.dtype == hidden_states.dtype and w2.dtype == hidden_states.dtype
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
+
+    # RDNA native MoE decode GEMV (radeon_ops): memory-bound bf16 SwiGLU expert GEMV,
+    # ~1.8x the Triton decode GEMV at T=1 on gfx1201. Plain-SwiGLU/bf16 only; router weight
+    # applied on output + summed over top-k inside the kernel; returns TP-local [M, H].
+    if (
+        activation == "silu"
+        and not apply_router_weight_on_input
+        and act_alpha == 1.0
+        and act_limit == float("inf")
+        and hidden_states.dtype is torch.bfloat16
+    ):
+        from freetoken.kernel.backend import is_radeon_installed
+
+        if is_radeon_installed():
+            from radeon_ops.backends.hip.native.moe import run_moe_decode_gemv
+
+            return run_moe_decode_gemv(hidden_states, w1, w2, topk_ids, topk_weights)
+
     M, _ = hidden_states.shape
     top_k = topk_ids.shape[1]
     gate_up_dim = w1.shape[1]

@@ -159,7 +159,12 @@ class _DenseReader:
             )
         if stored is None and tensor.dtype in _QUANT_DTYPES:
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
-        if stored is not None and role == "weight" and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]:
+        if (
+            stored is not None
+            and role == "weight"
+            and stored.kind is not QuantKind.FP8_BLOCK_QAT  # QAT weight ships bf16; quantized at load
+            and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]
+        ):
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {stored}")
         target, idx, count = self.target(module)
         _, parts, expected, _ = self.pending.setdefault(target, (count, {}, {}, stored))
@@ -185,7 +190,8 @@ class _DenseReader:
         return lines
 
     def _emit(self, target: str, parts: list[dict[str, torch.Tensor]], stored: QuantScheme | None):
-        if stored is not None:
+        # FP8_BLOCK_QAT ships a bf16 weight with no scale; pass it through and let the layer quantize at finalize
+        if stored is not None and stored.kind is not QuantKind.FP8_BLOCK_QAT:
             parts = [self._check(target, stored, part) for part in parts]
             if self.scheme(target) is None:
                 parts = [{"weight": _dequant(stored, part)} for part in parts]
@@ -300,8 +306,9 @@ class _TPShard:
 
 def _module_leaf(name: str) -> str:
     """The module name's leaf, with any quant-role suffix stripped (so ``...in_proj_qkv.weight``
-    and ``...in_proj_qkv.weight_scale_inv`` both resolve to ``in_proj_qkv``)."""
-    for suf in (".weight_scale_inv", ".weight_scale", ".weight", ".bias"):
+    and its nvfp4/fp8 companions ``.weight_scale``/``.weight_global``/``.input_scale``/
+    ``.weight_scale_inv`` all resolve to ``in_proj_qkv`` -> the same GDN shard rule)."""
+    for suf in (".weight_scale_inv", ".weight_scale", ".weight_global", ".input_scale", ".weight", ".bias"):
         if name.endswith(suf):
             name = name[: -len(suf)]
             break
@@ -313,7 +320,11 @@ def _shard_head_segments(t: torch.Tensor, head_counts, rank: int, world: int) ->
     ``head_counts``), by head. The per-head unit is derived from the tensor so one call serves
     both the fp8 weight (unit=head_dim) and its 128-block scale (unit=head_dim/128); this needs
     head_k_dim==head_v_dim (gdn.py asserts it). GDN requires every segment's head count to divide
-    evenly by tp (gdn.py enforces it), matching the in_proj layer's plain per-segment split."""
+    evenly by tp (gdn.py enforces it), matching the in_proj layer's plain per-segment split. A 0-d
+    scalar companion (nvfp4 ``input_scale``) has no row axis -> replicate; a 1-d per-output-row
+    ``weight_global`` [N] has shape[0]==N==total_heads*head_dim and head-shards like the weight."""
+    if t.dim() == 0:
+        return t
     total_heads = sum(head_counts)
     assert t.shape[0] % total_heads == 0, f"dim0 {t.shape[0]} not a multiple of {total_heads} heads"
     unit = t.shape[0] // total_heads
@@ -327,7 +338,12 @@ def _shard_head_segments(t: torch.Tensor, head_counts, rank: int, world: int) ->
 
 def _shard_by_heads(t: torch.Tensor, num_heads: int, rank: int, world: int, *, dim: int) -> torch.Tensor:
     """Slice ``dim`` (size ``num_heads * head_dim``) to this rank's heads; replicate one head
-    per rank when ``num_heads < world``."""
+    per rank when ``num_heads < world``. A companion that lacks the sharded axis rides the
+    un-sharded dim and REPLICATES: an nvfp4 scalar ``input_scale`` (0-d), or a per-output-row
+    ``weight_global`` [N] on a row-parallel (dim=1) leaf like out_proj (its [N] = the full,
+    un-sharded output)."""
+    if t.dim() == 0 or dim >= t.dim():
+        return t
     head_dim = t.shape[dim] // num_heads
     if num_heads < world:
         assert world % num_heads == 0, f"{world=} not a multiple of {num_heads=} for replication"
@@ -377,7 +393,9 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                     continue
                 if _STACKED_EXPERT_RE.match(name):
                     if stacked:
-                        yield name, shard.expert(name, f.get_tensor(raw_name))
+                        # deliver the full stacked expert; build_expert_banks._shard_piece owns the
+                        # per-rank TP split (sharding here too would double-shard the banks)
+                        yield name, f.get_tensor(raw_name)
                     continue
                 if reader is None:
                     continue

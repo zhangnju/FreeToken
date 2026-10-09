@@ -34,6 +34,51 @@ MARLIN_MAX_SLOTS = 992
 B12X_MIN_INTERMEDIATE = 1024
 
 
+def _radeon_nvfp4_tp_ok() -> bool:
+    """TP>1 nvfp4 is backed by the RDNA native decode GEMV (TP-agnostic); enable only when it's present."""
+    import os
+
+    if os.environ.get("RADEON_MOE", "1") == "0":
+        return False
+    try:
+        from freetoken.kernel.backend import is_radeon_installed
+
+        return is_radeon_installed()
+    except Exception:
+        return False
+
+
+def _radeon_nvfp4_prefill(x, banks, topk_weights, topk_ids, E):
+    """RDNA native fused nvfp4 prefill: two tiled W4A16 bf16-WMMA grouped GEMMs + silu + sum-reduce.
+    e2m1 weight nibble -> *per-16 group scale -> bf16 at the LDS load; per-row fp16 global at store.
+    Mirrors the decode hook's gating (plain-silu, bf16, no router-weight-on-input). gfx1100/gfx1201."""
+    import torch
+
+    from freetoken.kernel import moe_sum_reduce_triton
+    from freetoken.layers import gated_act_and_mul
+    from freetoken.moe.fused import moe_align_block_size
+    from radeon_ops.backends.hip.native.moe import pick_nvfp4_prefill_bm, run_moe_prefill_gemm_nvfp4_tiled
+
+    gup, dn = banks[0:3], banks[3:6]
+    M, H = x.shape
+    top_k = topk_ids.shape[1]
+    two_i = gup[0].shape[1]
+    inter = two_i // 2
+    bm = pick_nvfp4_prefill_bm(inter)                     # both GEMMs share one moe_align -> one bm
+    sids, eids, ntpp = moe_align_block_size(topk_ids, bm, E)
+    tw = topk_weights.reshape(-1).contiguous()
+    nv = topk_ids.numel()
+    ic1 = torch.zeros((M, top_k, two_i), device=x.device, dtype=x.dtype)
+    run_moe_prefill_gemm_nvfp4_tiled(x, *gup, ic1, tw, sids, eids, ntpp, nv, top_k, 0, bm=bm)
+    ic2 = torch.empty((M * top_k, inter), device=x.device, dtype=x.dtype)
+    gated_act_and_mul("silu", ic1.view(-1, two_i), ic2, alpha=1.0, limit=float("inf"))
+    ic3 = torch.zeros((M, top_k, H), device=x.device, dtype=x.dtype)
+    run_moe_prefill_gemm_nvfp4_tiled(ic2, *dn, ic3, tw, sids, eids, ntpp, nv, 1, 1, bm=bm)
+    out = torch.empty_like(x)
+    moe_sum_reduce_triton(ic3, out)
+    return out
+
+
 class TritonNvfp4MoEKernel(MoEKernel):
     """FreeToken's inline-dequant kernels over the native ModelOpt rows."""
 
@@ -41,14 +86,18 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        # Stock triton nvfp4 rejects TP>1; the RDNA native decode GEMV (radeon_ops) IS TP-agnostic, so
+        # open TP>1 when it's present (RADEON_MOE on + lib loadable). Decode -> native; prefill -> triton.
+        reason = self._common_reject(cfg, tp_ok=_radeon_nvfp4_tp_ok(), cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        # TP-local intermediate: the banks hold THIS rank's expert slice (pieces are sharded by
+        # _shard_piece to local_intermediate), so size the gate_up/down dims by local, not full, I.
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
@@ -61,20 +110,42 @@ class TritonNvfp4MoEKernel(MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
         out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale"))
-        out["gate_up_global"].copy_(fused_global(pieces, cfg.intermediate))
+        out["gate_up_global"].copy_(fused_global(pieces, cfg.local_intermediate))
         out["down"].copy_(pieces["down"])
         out["down_scale"].copy_(pieces["down_scale"])
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))
         return {}
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+        import os
+
         from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4
 
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
+        # RDNA native path (radeon_ops): reads 4-bit packed experts, unpacks e2m1 in-register. Plain-silu
+        # only (gate*sigmoid(gate)*up); decode -> fused GEMV (W4A16); prefill -> 2 tiled bf16-WMMA GEMMs.
+        radeon_ok = (
+            os.environ.get("RADEON_MOE", "1") != "0"
+            and x.dtype is torch.bfloat16
+            and layer.activation == "silu"
+            and abs(alpha - 1.0) < 1e-6
+            and limit == float("inf")
+            and not layer.apply_router_weight_on_input
+        )
+        if radeon_ok:
+            from freetoken.kernel.backend import is_radeon_installed
+
+            radeon_ok = is_radeon_installed()
         if is_prefill:
+            if radeon_ok:
+                return _radeon_nvfp4_prefill(x, banks, topk_weights, topk_ids, view.n)
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+        if radeon_ok:
+            from radeon_ops.backends.hip.native.moe import run_moe_decode_gemv_nvfp4
+
+            return run_moe_decode_gemv_nvfp4(x, *banks, topk_ids, topk_weights)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
 
 
