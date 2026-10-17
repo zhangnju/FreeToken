@@ -35,28 +35,25 @@ def _moe_decode():
     return run_moe_decode_gemv_mxfp4_gptoss
 
 
-# ---- per-32-K fp8 weight quant (CPU; returns fp8 weight, per-row/per-32 scale, padded-K, bf16 dequant) ----
+# ---- per-32-K fp8 weight quant (CPU; returns fp8 weight, per-row/per-32 scale, bf16 dequant for prefill) ----
 def _quant_g32(weight):
     import torch
-    import torch.nn.functional as F
     dev = weight.device
     w = weight.detach().to("cpu", torch.float32)
-    N, K = w.shape
-    Kp = ((K + 127) // 128) * 128
-    wf = F.pad(w, (0, Kp - K)); del w
-    wb = wf.reshape(N, Kp // 32, 32)
+    N, K = w.shape                              # K must be a multiple of 32 (gpt-oss attn/lm_head: 2880/4096)
+    wb = w.reshape(N, K // 32, 32)
     scale = wb.abs().amax(dim=2, keepdim=True).clamp(min=1e-6) / 448.0
     qf = (wb / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-    wq = qf.reshape(N, Kp).contiguous().to(dev)
-    sinv = scale.reshape(N, Kp // 32).to(torch.bfloat16).contiguous().to(dev)
-    deq = (qf.float() * scale).reshape(N, Kp)[:, :K].to(torch.bfloat16).contiguous().to(dev)
-    return wq, sinv, Kp, deq
+    wq = qf.reshape(N, K).contiguous().to(dev)
+    sinv = scale.reshape(N, K // 32).to(torch.bfloat16).contiguous().to(dev)
+    deq = (qf.float() * scale).reshape(N, K).to(torch.bfloat16).contiguous().to(dev)
+    return wq, sinv, deq
 
 
 def _cache(mod):
     if not hasattr(mod, "_radeon_wq"):
-        mod._radeon_wq, mod._radeon_sinv, mod._radeon_Kp, mod._radeon_deq = _quant_g32(mod.weight)
-    return mod._radeon_wq, mod._radeon_sinv, mod._radeon_Kp, mod._radeon_deq
+        mod._radeon_wq, mod._radeon_sinv, mod._radeon_deq = _quant_g32(mod.weight)
+    return mod._radeon_wq, mod._radeon_sinv, mod._radeon_deq
 
 
 def _patch_dense():
@@ -74,11 +71,9 @@ def _patch_dense():
     def lm_forward(self, x):
         try:
             if self.tied_embedding is None and getattr(self, "tp_size", 1) == 1 and hasattr(self, "weight"):
-                wq, sinv, Kp, _ = _cache(self)   # pre-quantize at prefill too (before decode-graph capture)
+                wq, sinv, _ = _cache(self)   # pre-quantize at prefill too (before decode-graph capture)
                 if _decode_m1():
-                    xf = x.reshape(1, -1)
-                    xp = F.pad(xf, (0, Kp - xf.shape[1])) if Kp != xf.shape[1] else xf
-                    return _dense_gemv()(xp, wq, sinv)[:, : self.num_embeddings]
+                    return _dense_gemv()(x.reshape(1, -1), wq, sinv)[:, : self.num_embeddings]
         except Exception as e:  # pragma: no cover
             print(f"[radeon_opt] lm_head fallback: {e}", file=sys.stderr, flush=True)
         return orig_lm(self, x)
@@ -93,14 +88,12 @@ def _patch_dense():
             if getattr(self, "_tp_size", 1) in (0, 1) \
                     and getattr(self, "prefix", "").endswith(("qkv_proj", "o_proj")) \
                     and hasattr(self, "weight") and x.shape[-1] == self.weight.shape[1]:
-                wq, sinv, Kp, deq = _cache(self)
+                wq, sinv, deq = _cache(self)
                 bias = getattr(self, "bias", None)
                 b = get_global_ctx().batch
                 if b.is_prefill or b.size > 1:
                     return F.linear(x, deq, bias)   # prefill: dequantized fp8 weights (consistent with decode)
-                xf = x.reshape(1, -1)
-                xp = F.pad(xf, (0, Kp - xf.shape[1])) if Kp != xf.shape[1] else xf
-                y = _dense_gemv()(xp, wq, sinv)[:, : self.weight.shape[0]]
+                y = _dense_gemv()(x.reshape(1, -1), wq, sinv)[:, : self.weight.shape[0]]
                 return y + bias if bias is not None else y
         except Exception as e:  # pragma: no cover
             print(f"[radeon_opt] dense fallback: {e}", file=sys.stderr, flush=True)
