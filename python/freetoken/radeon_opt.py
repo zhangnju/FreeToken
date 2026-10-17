@@ -29,6 +29,12 @@ def _dense_gemv():
     return run_dense_gemv_fp8_g32
 
 
+def _dense_bf16():
+    _ensure_radeon_on_path()
+    from radeon_ops.backends.hip.native.moe import run_dense_gemv_bf16
+    return run_dense_gemv_bf16
+
+
 def _moe_decode():
     _ensure_radeon_on_path()
     from radeon_ops.backends.hip.native.moe import run_moe_decode_gemv_mxfp4_gptoss
@@ -85,16 +91,24 @@ def _patch_dense():
 
     def dense_forward(self, x, orig):
         try:
-            if getattr(self, "_tp_size", 1) in (0, 1) \
-                    and getattr(self, "prefix", "").endswith(("qkv_proj", "o_proj")) \
-                    and hasattr(self, "weight") and x.shape[-1] == self.weight.shape[1]:
-                wq, sinv, deq = _cache(self)
+            if getattr(self, "_tp_size", 1) in (0, 1) and hasattr(self, "weight") \
+                    and x.shape[-1] == self.weight.shape[1]:
                 bias = getattr(self, "bias", None)
                 b = get_global_ctx().batch
-                if b.is_prefill or b.size > 1:
-                    return F.linear(x, deq, bias)   # prefill: dequantized fp8 weights (consistent with decode)
-                y = _dense_gemv()(x.reshape(1, -1), wq, sinv)[:, : self.weight.shape[0]]
-                return y + bias if bias is not None else y
+                # gpt-oss MoE router gate (uniquely tiny N=num_experts): EXACT bf16 GEMV -- it feeds top-k, so
+                # no quant; the win is removing the per-call rocBLAS tiny-GEMM that serialises the decode graph.
+                if self.weight.shape[0] <= 64:
+                    if b.is_prefill or b.size > 1:
+                        return orig(self, x)
+                    y = _dense_bf16()(x.reshape(1, -1), self.weight)[:, : self.weight.shape[0]]
+                    return y + bias if bias is not None else y
+                # attention qkv/o projections: per-32 fp8 GEMV (lossless)
+                if getattr(self, "prefix", "").endswith(("qkv_proj", "o_proj")):
+                    wq, sinv, deq = _cache(self)
+                    if b.is_prefill or b.size > 1:
+                        return F.linear(x, deq, bias)   # prefill: dequantized fp8 weights (consistent)
+                    y = _dense_gemv()(x.reshape(1, -1), wq, sinv)[:, : self.weight.shape[0]]
+                    return y + bias if bias is not None else y
         except Exception as e:  # pragma: no cover
             print(f"[radeon_opt] dense fallback: {e}", file=sys.stderr, flush=True)
         return orig(self, x)
